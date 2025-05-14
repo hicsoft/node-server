@@ -214,15 +214,9 @@ export const newRequest = (
     const parts = forwarded.split(';')
     for (const part of parts) {
       const [key, value] = part.split('=')
-      if (key === 'for') {
-        // IP address
-        req.headers['x-real-ip'] = value
-      } else if (key === 'host') {
-        // Hostname
-        req.headers['x-forwarded-host'] = value
-      } else if (key === 'proto') {
+      if (key === 'proto') {
         // Protocol
-        px.s = req.headers['x-forwarded-proto'] = value
+        px.s = value
       }
     }
     if (px.s === 'https') {

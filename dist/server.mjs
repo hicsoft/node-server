@@ -164,12 +164,8 @@ var newRequest = (incoming, defaultHostname) => {
     const parts = forwarded.split(";");
     for (const part of parts) {
       const [key, value] = part.split("=");
-      if (key === "for") {
-        req.headers["x-real-ip"] = value;
-      } else if (key === "host") {
-        req.headers["x-forwarded-host"] = value;
-      } else if (key === "proto") {
-        px.s = req.headers["x-forwarded-proto"] = value;
+      if (key === "proto") {
+        px.s = value;
       }
     }
     if (px.s === "https") {

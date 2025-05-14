@@ -207,6 +207,31 @@ export const newRequest = (
     throw new RequestError('Invalid host header')
   }
 
+  const px: { s?: string } = { }
+  // forwarded: 'for=150.249.205.213;host=b0paw580nh.execute-api.ap-northeast-1.amazonaws.com;proto=https'
+  const forwarded = incoming.headers.forwarded
+  if (forwarded != null) {
+    const parts = forwarded.split(';')
+    for (const part of parts) {
+      const [key, value] = part.split('=')
+      if (key === 'for') {
+        // IP address
+        req.headers['x-real-ip'] = value
+      } else if (key === 'host') {
+        // Hostname
+        req.headers['x-forwarded-host'] = value
+      } else if (key === 'proto') {
+        // Protocol
+        px.s = req.headers['x-forwarded-proto'] = value
+      }
+    }
+    if (px.s === 'https') {
+      req[urlKey] = (new URL(`https://${host}${incomingUrl}`)).href
+
+      return req
+    }
+  }
+
   req[urlKey] = url.href
 
   return req

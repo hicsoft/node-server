@@ -1,8 +1,8 @@
 import type { Context, Env, MiddlewareHandler } from 'hono'
-import { getFilePath, getFilePathWithoutDefaultDocument } from 'hono/utils/filepath'
 import { getMimeType } from 'hono/utils/mime'
-import { createReadStream, lstatSync } from 'node:fs'
 import type { ReadStream, Stats } from 'node:fs'
+import { createReadStream, lstatSync } from 'node:fs'
+import { join } from 'node:path'
 
 export type ServeStaticOptions<E extends Env = Env> = {
   /**
@@ -12,7 +12,7 @@ export type ServeStaticOptions<E extends Env = Env> = {
   path?: string
   index?: string // default is 'index.html'
   precompressed?: boolean
-  rewriteRequestPath?: (path: string) => string
+  rewriteRequestPath?: (path: string, c: Context<E>) => string
   onFound?: (path: string, c: Context<E>) => void | Promise<void>
   onNotFound?: (path: string, c: Context<E>) => void | Promise<void>
 }
@@ -44,10 +44,6 @@ const createStreamBody = (stream: ReadStream) => {
   return body
 }
 
-const addCurrentDirPrefix = (path: string) => {
-  return `./${path}`
-}
-
 const getStats = (path: string) => {
   let stats: Stats | undefined
   try {
@@ -56,7 +52,13 @@ const getStats = (path: string) => {
   return stats
 }
 
-export const serveStatic = (options: ServeStaticOptions = { root: '' }): MiddlewareHandler => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const serveStatic = <E extends Env = any>(
+  options: ServeStaticOptions<E> = { root: '' }
+): MiddlewareHandler<E> => {
+  const root = options.root || ''
+  const optionPath = options.path
+
   return async (c, next) => {
     // Do nothing if Response is already set
     if (c.finalized) {
@@ -65,39 +67,30 @@ export const serveStatic = (options: ServeStaticOptions = { root: '' }): Middlew
 
     let filename: string
 
-    try {
-      filename = options.path ?? decodeURIComponent(c.req.path)
-    } catch {
-      await options.onNotFound?.(c.req.path, c)
-      return next()
-    }
-
-    let path = getFilePathWithoutDefaultDocument({
-      filename: options.rewriteRequestPath ? options.rewriteRequestPath(filename) : filename,
-      root: options.root,
-    })
-
-    if (path) {
-      path = addCurrentDirPrefix(path)
+    if (optionPath) {
+      filename = optionPath
     } else {
-      return next()
+      try {
+        filename = decodeURIComponent(c.req.path)
+        if (/(?:^|[\/\\])\.\.(?:$|[\/\\])/.test(filename)) {
+          throw new Error()
+        }
+      } catch {
+        await options.onNotFound?.(c.req.path, c)
+        return next()
+      }
     }
+
+    let path = join(
+      root,
+      !optionPath && options.rewriteRequestPath ? options.rewriteRequestPath(filename, c) : filename
+    )
 
     let stats = getStats(path)
 
     if (stats && stats.isDirectory()) {
-      path = getFilePath({
-        filename: options.rewriteRequestPath ? options.rewriteRequestPath(filename) : filename,
-        root: options.root,
-        defaultDocument: options.index ?? 'index.html',
-      })
-
-      if (path) {
-        path = addCurrentDirPrefix(path)
-      } else {
-        return next()
-      }
-
+      const indexFile = options.index ?? 'index.html'
+      path = join(path, indexFile)
       stats = getStats(path)
     }
 

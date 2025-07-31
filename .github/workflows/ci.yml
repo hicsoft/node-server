@@ -15,7 +15,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 22.x]
+        node-version: [18.x, 20.x, 22.x, 24.x]
 
     steps:
       - uses: actions/checkout@v4
@@ -28,4 +28,16 @@ jobs:
       - run: bun run format
       - run: bun run lint
       - run: bun run build
+      - run: bun run test
+
+  ci-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
       - run: bun run test

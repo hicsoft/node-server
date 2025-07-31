@@ -1,19 +1,31 @@
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeaders } from 'node:http'
-import type { Http2ServerRequest, Http2ServerResponse } from 'node:http2'
+import { Http2ServerRequest } from 'node:http2'
+import type { Http2ServerResponse } from 'node:http2'
+import type { Writable } from 'node:stream'
+import type { IncomingMessageWithWrapBodyStream } from './request'
 import {
   abortControllerKey,
   newRequest,
   Request as LightweightRequest,
+  wrapBodyStream,
   toRequestError,
 } from './request'
-import { cacheKey, getInternalBody, Response as LightweightResponse } from './response'
+import { cacheKey, Response as LightweightResponse } from './response'
+import type { InternalCache } from './response'
 import type { CustomErrorHandler, FetchCallback, HttpBindings } from './types'
-import { writeFromReadableStream, buildOutgoingHttpHeaders } from './utils'
+import {
+  readWithoutBlocking,
+  writeFromReadableStream,
+  writeFromReadableStreamDefaultReader,
+  buildOutgoingHttpHeaders,
+} from './utils'
 import { X_ALREADY_SENT } from './utils/response/constants'
 import './globals'
 
-const regBuffer = /^no$/i
-const regContentType = /^(application\/json\b|text\/(?!event-stream\b))/i
+const outgoingEnded = Symbol('outgoingEnded')
+type OutgoingHasOutgoingEnded = Http2ServerResponse & {
+  [outgoingEnded]?: () => void
+}
 
 const handleRequestError = (): Response =>
   new Response(null, {
@@ -44,22 +56,45 @@ const handleResponseError = (e: unknown, outgoing: ServerResponse | Http2ServerR
   }
 }
 
-const responseViaCache = (
+const flushHeaders = (outgoing: ServerResponse | Http2ServerResponse) => {
+  // If outgoing is ServerResponse (HTTP/1.1), it requires this to flush headers.
+  // However, Http2ServerResponse is sent without this.
+  if ('flushHeaders' in outgoing && outgoing.writable) {
+    outgoing.flushHeaders()
+  }
+}
+
+const responseViaCache = async (
   res: Response,
   outgoing: ServerResponse | Http2ServerResponse
-): undefined | Promise<undefined | void> => {
+): Promise<undefined | void> => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [status, body, header] = (res as any)[cacheKey]
+  let [status, body, header] = (res as any)[cacheKey] as InternalCache
+  if (header instanceof Headers) {
+    header = buildOutgoingHttpHeaders(header)
+  }
+
   if (typeof body === 'string') {
     header['Content-Length'] = Buffer.byteLength(body)
-    outgoing.writeHead(status, header)
+  } else if (body instanceof Uint8Array) {
+    header['Content-Length'] = body.byteLength
+  } else if (body instanceof Blob) {
+    header['Content-Length'] = body.size
+  }
+
+  outgoing.writeHead(status, header)
+  if (typeof body === 'string' || body instanceof Uint8Array) {
     outgoing.end(body)
+  } else if (body instanceof Blob) {
+    outgoing.end(new Uint8Array(await body.arrayBuffer()))
   } else {
-    outgoing.writeHead(status, header)
-    return writeFromReadableStream(body, outgoing)?.catch(
+    flushHeaders(outgoing)
+    await writeFromReadableStream(body, outgoing)?.catch(
       (e) => handleResponseError(e, outgoing) as undefined
     )
   }
+
+  ;(outgoing as OutgoingHasOutgoingEnded)[outgoingEnded]?.()
 }
 
 const responseViaResponseObject = async (
@@ -89,64 +124,60 @@ const responseViaResponseObject = async (
 
   const resHeaderRecord: OutgoingHttpHeaders = buildOutgoingHttpHeaders(res.headers)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const internalBody = getInternalBody(res as any)
-  if (internalBody) {
-    const { length, source, stream } = internalBody
-    if (source instanceof Uint8Array && source.byteLength !== length) {
-      // maybe `source` is detached, so we should send via res.body
-    } else {
-      // send via internal raw data
-      if (length) {
-        resHeaderRecord['content-length'] = length
-      }
-      outgoing.writeHead(res.status, resHeaderRecord)
-      if (typeof source === 'string' || source instanceof Uint8Array) {
-        outgoing.end(source)
-      } else if (source instanceof Blob) {
-        outgoing.end(new Uint8Array(await source.arrayBuffer()))
-      } else {
-        await writeFromReadableStream(stream, outgoing)
-      }
-      return
-    }
-  }
-
   if (res.body) {
-    /**
-     * If content-encoding is set, we assume that the response should be not decoded.
-     * Else if transfer-encoding is set, we assume that the response should be streamed.
-     * Else if content-length is set, we assume that the response content has been taken care of.
-     * Else if x-accel-buffering is set to no, we assume that the response should be streamed.
-     * Else if content-type is not application/json nor text/* but can be text/event-stream,
-     * we assume that the response should be streamed.
-     */
+    const reader = res.body.getReader()
 
-    const {
-      'transfer-encoding': transferEncoding,
-      'content-encoding': contentEncoding,
-      'content-length': contentLength,
-      'x-accel-buffering': accelBuffering,
-      'content-type': contentType,
-    } = resHeaderRecord
+    const values: Uint8Array[] = []
+    let done = false
+    let currentReadPromise: Promise<ReadableStreamReadResult<Uint8Array>> | undefined = undefined
 
-    if (
-      transferEncoding ||
-      contentEncoding ||
-      contentLength ||
-      // nginx buffering variant
-      (accelBuffering && regBuffer.test(accelBuffering as string)) ||
-      !regContentType.test(contentType as string)
-    ) {
-      outgoing.writeHead(res.status, resHeaderRecord)
+    // In the case of synchronous responses, usually a maximum of two readings is done
+    for (let i = 0; i < 2; i++) {
+      currentReadPromise = reader.read()
+      const chunk = await readWithoutBlocking(currentReadPromise).catch((e) => {
+        console.error(e)
+        done = true
+      })
+      if (!chunk) {
+        if (i === 1 && resHeaderRecord['transfer-encoding'] !== 'chunked') {
+          // XXX: In Node.js v24, some response bodies are not read all the way through until the next task queue,
+          // so wait a moment and retry. (e.g. new Blob([new Uint8Array(contents)]) )
+          await new Promise((resolve) => setTimeout(resolve))
+          i--
+          continue
+        }
 
-      await writeFromReadableStream(res.body, outgoing)
+        // Error occurred or currentReadPromise is not yet resolved.
+        // If an error occurs, immediately break the loop.
+        // If currentReadPromise is not yet resolved, pass it to writeFromReadableStreamDefaultReader.
+        break
+      }
+      currentReadPromise = undefined
+
+      if (chunk.value) {
+        values.push(chunk.value)
+      }
+      if (chunk.done) {
+        done = true
+        break
+      }
+    }
+
+    if (done && !('content-length' in resHeaderRecord)) {
+      resHeaderRecord['content-length'] = values.reduce((acc, value) => acc + value.length, 0)
+    }
+
+    outgoing.writeHead(res.status, resHeaderRecord)
+    values.forEach((value) => {
+      ;(outgoing as Writable).write(value)
+    })
+    if (done) {
+      outgoing.end()
     } else {
-      const buffer = await res.arrayBuffer()
-      resHeaderRecord['content-length'] = buffer.byteLength
-
-      outgoing.writeHead(res.status, resHeaderRecord)
-      outgoing.end(new Uint8Array(buffer))
+      if (values.length === 0) {
+        flushHeaders(outgoing)
+      }
+      await writeFromReadableStreamDefaultReader(reader, outgoing, currentReadPromise)
     }
   } else if (resHeaderRecord[X_ALREADY_SENT]) {
     // do nothing, the response has already been sent
@@ -154,6 +185,8 @@ const responseViaResponseObject = async (
     outgoing.writeHead(res.status, resHeaderRecord)
     outgoing.end()
   }
+
+  ;(outgoing as OutgoingHasOutgoingEnded)[outgoingEnded]?.()
 }
 
 export const getRequestListener = (
@@ -162,8 +195,10 @@ export const getRequestListener = (
     hostname?: string
     errorHandler?: CustomErrorHandler
     overrideGlobalObjects?: boolean
+    autoCleanupIncoming?: boolean
   } = {}
 ) => {
+  const autoCleanupIncoming = options.autoCleanupIncoming ?? true
   if (options.overrideGlobalObjects !== false && global.Request !== LightweightRequest) {
     Object.defineProperty(global, 'Request', {
       value: LightweightRequest,
@@ -185,17 +220,59 @@ export const getRequestListener = (
       // so generate a pseudo Request object with only the minimum required information.
       req = newRequest(incoming, options.hostname)
 
+      let incomingEnded =
+        !autoCleanupIncoming || incoming.method === 'GET' || incoming.method === 'HEAD'
+      if (!incomingEnded) {
+        ;(incoming as IncomingMessageWithWrapBodyStream)[wrapBodyStream] = true
+        incoming.on('end', () => {
+          incomingEnded = true
+        })
+
+        if (incoming instanceof Http2ServerRequest) {
+          // a Http2ServerResponse instance requires additional processing on exit
+          // since outgoing.on('close') is not called even after outgoing.end() is called
+          // when the state is incomplete
+          ;(outgoing as OutgoingHasOutgoingEnded)[outgoingEnded] = () => {
+            // incoming is not consumed to the end
+            if (!incomingEnded) {
+              setTimeout(() => {
+                // in the case of a simple POST request, the cleanup process may be done automatically
+                // and end is called at this point. At that point, nothing is done.
+                if (!incomingEnded) {
+                  setTimeout(() => {
+                    incoming.destroy()
+                    // a Http2ServerResponse instance will not terminate without also calling outgoing.destroy()
+                    outgoing.destroy()
+                  })
+                }
+              })
+            }
+          }
+        }
+      }
+
       // Detect if request was aborted.
       outgoing.on('close', () => {
         const abortController = req[abortControllerKey] as AbortController | undefined
-        if (!abortController) {
-          return
+        if (abortController) {
+          if (incoming.errored) {
+            req[abortControllerKey].abort(incoming.errored.toString())
+          } else if (!outgoing.writableFinished) {
+            req[abortControllerKey].abort('Client connection prematurely closed.')
+          }
         }
 
-        if (incoming.errored) {
-          req[abortControllerKey].abort(incoming.errored.toString())
-        } else if (!outgoing.writableFinished) {
-          req[abortControllerKey].abort('Client connection prematurely closed.')
+        // incoming is not consumed to the end
+        if (!incomingEnded) {
+          setTimeout(() => {
+            // in the case of a simple POST request, the cleanup process may be done automatically
+            // and end is called at this point. At that point, nothing is done.
+            if (!incomingEnded) {
+              setTimeout(() => {
+                incoming.destroy()
+              })
+            }
+          })
         }
       })
 
